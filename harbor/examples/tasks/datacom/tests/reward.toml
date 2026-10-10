@@ -1,0 +1,39 @@
+# 顶层聚合：Harbor 读 reward.json 里的 "reward" 键作为这个 task 的主分数。
+#
+# 权重与原评分体系 §7.1 一致：
+#   correctness 0.50（功能实现完整性）
+#   quality     0.40（代码质量）
+#   process     0.10（性能轨迹，产物类场景降权）
+#
+# 三个维度分数会**保留**在 reward.json 输出里（Harbor 允许同时存在多个 key），
+# 这一点对本次实验至关重要：跨模型对比要按维度看，而不是只看一个总分——
+# "新模型实现更完整但更啰嗦"这种结论只有在维度层面才看得出来。
+#
+# ═════════════════════════════════════════════════════════════════════════════
+# 通过条件为什么不在这个文件里
+# ═════════════════════════════════════════════════════════════════════════════
+# 原体系的通过条件是同一个 AND 表达式：
+#
+#     最终评分 >= 0.70  AND  feature_completeness >= 0.60
+#
+# rewardkit 的聚合模式里没有"跨维度阈值相乘"这一档：
+#   * threshold 只看加权平均本身；
+#   * required-pass / all-pass 要求维度分数达到 1.0，过于严苛。
+#
+# 所以这个 AND 放在**对比报告层**（compare/model_comparison_plugin.py），
+# 理由是它天然属于"决策"而不是"打分"：
+#   * 判分只需要回答"多好"，reward.json 已经够了；
+#   * "能不能上生产"是看报告的人根据阈值做判断，阈值随时可能变，
+#     改阈值不该触发重新判分。
+# 阈值常量同时写在 /opt/datacom_eval/reward.py 里（PASS_THRESHOLD /
+# FEATURE_COMPLETENESS_FLOOR），报告插件从那里读，保持单一事实源。
+#
+# ⚠️ 权重必须与 _lib/reward.py 的 DIMENSION_WEIGHTS 保持一致。
+#    这里不能 import Python 常量（reward.toml 是声明式的），所以只能靠纪律 +
+#    报告插件里的交叉校验。报告插件会在两者不一致时打 warning。
+# ═════════════════════════════════════════════════════════════════════════════
+
+[[reward]]
+name = "reward"
+aggregation = "weighted-mean"
+weights = { correctness = 0.50, quality = 0.40, process = 0.10 }

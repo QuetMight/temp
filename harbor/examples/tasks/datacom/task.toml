@@ -1,43 +1,78 @@
 schema_version = "1.4"
 
-# ═════════════════════════════════════════════════════════════════════════════
-# datacom —— 三步任务骨架
+# ─────────────────────────────────────────────────────────────────────────────
+# 送进 verifier 容器的东西
 #
-#   new_spec   → 产出规格说明 /app/spec.md          （verify 置空）
-#   new_plan   → 产出实现计划 /app/plan.md          （verify 置空）
-#   implement  → 按计划实现                         （唯一的真实验证步骤）
+# ⚠️ 必须放在**第一个 [table] 头之前**：TOML 里裸键会归属到最近打开的表，
+#    写在 [verifier.environment.env] 之后就会被解析成
+#    verifier.environment.env.artifacts —— Harbor 读不到，verifier 拿不到任何东西。
 #
-# 关键设计：
-#   * multi_step_reward_strategy = "final"
-#       试炼级 reward 只取**最后一个执行过的 step** 的 verifier 结果，
-#       因此前两步那个恒为 1.0 的占位 verifier 不会稀释分数。
-#   * 前两步 environment_mode = "shared"
-#       占位 verifier 直接跑在 agent 容器里，不额外起容器、不额外计费。
-#   * 第三步 environment_mode = "separate" + steps/implement/tests/Dockerfile
-#       自定义 verifier 在独立容器里跑；判分流程由 /tests/verify.py 管理
-#       （构建 / 测试 / LLM 打分 / 执行过程分析）。
+# separate verifier 看不到 agent 的文件系统，能过去的只有这里声明的内容（加隐式
+# 注入的发布目录 /logs/artifacts/）。投递时回到**原始 source 路径**，所以 /app
+# 就是 /app —— 正好对上 rewardkit 的 --workspace 默认值。
 #
-# 注意：Harbor **没有** per-step 关闭验证的字段（VerifierConfig.disable 只在
-# trial 级运行配置里）。所以"中间步骤 verify 置空"是通过给它们一个什么都不做、
-# 只写恒定 reward 的 tests/test.sh 实现的。
-# ═════════════════════════════════════════════════════════════════════════════
+# 排除项是刻意的：.git 很大且不需要（变更分析走 collect 钩子产出的 patch），
+# 构建产物/依赖目录会把 trial 目录撑爆，而 docker 下这一步是实打实的磁盘 IO。
+# ─────────────────────────────────────────────────────────────────────────────
+artifacts = [
+    { source = "/app", exclude = [
+        ".git",
+        "build",
+        "dist",
+        "node_modules",
+        "__pycache__",
+        "*.o",
+        "*.pyc",
+    ] },
+    # ATIF 轨迹。单步 trial 下它就是**整条 SDD 会话**（spec→plan→implement 都在
+    # 一个 session 里），过程维度判分与轨迹数据对比都靠它。
+    "/logs/agent/trajectory.json",
+]
 
-multi_step_reward_strategy = "final"
+# ═════════════════════════════════════════════════════════════════════════════
+# datacom —— 模型换代对比评测的最小可跑单元
+#
+# 这个 task 只回答一个问题：**同一份任务、同一套 SDD 技能，换模型之后
+# 代码生成效果与轨迹数据（token / 缓存 / 耗时）变好还是变差。**
+#
+# 三条核心设计（每条在 README 里都有详细理由）：
+#
+# 1. 单步 task，不是多步。
+#    SDD（spec → plan → implement）是被测 agent 的**技能套件**，在 agent 内部
+#    顺次执行。拆成 Harbor 的 [[steps]] 会让每个阶段开一个全新会话，方法论断裂，
+#    而且 /logs/agent/trajectory.json 只会剩最后一步——正好毁掉"轨迹数据对比"
+#    这个需求本身。
+#
+# 2. 对比发生在 Job 层，不在 task 里。
+#    Harbor 的 agents × datasets 笛卡尔积就是对比矩阵（job_plan.py）。
+#    task 保持 agent 无关：它只说"评什么"，不说"用哪个模型评"。
+#
+# 3. verifier 必须是 separate。
+#    判分要读 rubric/参考答案、要出网调 LLM judge、要装 rewardkit，而这些都不该
+#    让被测 agent 看见（shared verifier 会把 tests/ 上传进 agent 容器）。
+#    separate 容器同时解决隔离与依赖两件事。
+# ═════════════════════════════════════════════════════════════════════════════
 
 [task]
 name = "harbor/datacom"
-version = "0.1.0"
-description = "三步 datacom 任务骨架：先写规格、再写计划、最后实现；仅在最后一步用独立 verifier 打分。"
+version = "0.2.0"
+description = "datacom 需求实现任务：被测 agent 用 SDD 技能套件完成 spec → plan → implement，由独立 verifier 按三维度打分，用于跨模型的对比评测。"
 authors = []
-keywords = ["datacom", "multi-step", "separate-verifier", "skeleton"]
+keywords = ["datacom", "sdd", "model-comparison", "rewardkit"]
 
 [metadata]
 difficulty = "medium"
 category = "programming"
-tags = ["datacom", "multi-step", "separate-verifier", "skeleton"]
+tags = ["datacom", "sdd", "model-comparison", "separate-verifier"]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# agent 环境：三个 step 共享同一个容器，文件系统跨步持久
+# 被测工作区（agent 容器）
+#
+# workdir 同时是三个约定的锚点：
+#   * agent 在这里做 SDD 三阶段的工作
+#   * rewardkit 的 --workspace 默认值就是 /app
+#   * artifacts 把 /app 原样投递回 verifier 的 /app
+# 三者对齐是刻意的，改一个就要改另外两个。
 # ─────────────────────────────────────────────────────────────────────────────
 [environment]
 build_timeout_sec = 1200.0
@@ -51,89 +86,50 @@ network_mode = "public"
 
 [environment.env]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 默认 agent / verifier 配置（各 step 未显式覆盖时继承）
-# ─────────────────────────────────────────────────────────────────────────────
+# agent 阶段超时。SDD 三阶段（尤其 implement 的构建+自测）比较长，但它只是
+# "防挂死"的上限，不是评测指标——真正的耗时对比读的是
+# TrialResult.agent_execution 的实际时间戳。
 [agent]
-timeout_sec = 1800.0
-
-[verifier]
-timeout_sec = 300.0
+timeout_sec = 3600.0
 
 [solution.env]
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Step 1 / new_spec —— 写规格；不做实质校验
-# ═════════════════════════════════════════════════════════════════════════════
-[[steps]]
-name = "new_spec"
-
-[steps.agent]
-timeout_sec = 900.0
-
-[steps.verifier]
-# 显式 shared：不额外起容器。tests/test.sh 是空占位，只写 reward = 1.0。
-environment_mode = "shared"
-timeout_sec = 60.0
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Step 2 / new_plan —— 写实现计划；不做实质校验
-# ═════════════════════════════════════════════════════════════════════════════
-[[steps]]
-name = "new_plan"
-
-[steps.agent]
-timeout_sec = 900.0
-
-[steps.verifier]
-environment_mode = "shared"
-timeout_sec = 60.0
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Step 3 / implement —— 实现；唯一的真实验证步骤
-# ═════════════════════════════════════════════════════════════════════════════
-[[steps]]
-name = "implement"
-
-# 仅在最后一步收集交付物。separate verifier 拿不到 agent 的文件系统，
-# 能进 verifier 容器的只有下面这些条目（回到它们的原始 source 路径）
-# 加上隐式注入的发布目录 /logs/artifacts/。
-artifacts = [
-    "/app/spec.md",
-    "/app/plan.md",
-    "/logs/agent/trajectory.json",
-]
-
-[steps.agent]
-timeout_sec = 3600.0
-
-[steps.verifier]
-timeout_sec = 3600.0
+# ─────────────────────────────────────────────────────────────────────────────
+# 判分：独立容器 + rewardkit
+# ─────────────────────────────────────────────────────────────────────────────
+[verifier]
+timeout_sec = 2400.0
 environment_mode = "separate"
 
-# 独立 verifier 环境。
-# 这里**故意不写 docker_image**，让 steps/implement/tests/Dockerfile 成为
-# verifier 镜像（Harbor 的镜像优先级：本 step 的 docker_image > 本 step 的
-# tests/Dockerfile > task 级 verifier 镜像 > task 级 tests/Dockerfile >
-# 回退到 agent 环境）。命中前 4 项时 Harbor 不再上传 tests/，镜像必须自带
-# /tests/test.sh。
-[steps.verifier.environment]
-network_mode = "public"      # LLM 打分需要出网
+# 不写 docker_image —— 让 tests/Dockerfile 成为 verifier 镜像（Harbor 的镜像
+# 优先级：本 step 的 docker_image > tests/Dockerfile > task 级 verifier 镜像 >
+# agent 环境）。命中前两档时 Harbor 认为测试已烘进镜像（bundled_tests），运行期
+# 不再上传 tests/，所以 /tests 的内容完全来自镜像的 COPY，rubric 与参考答案
+# 因此**不可能**泄漏进 agent 容器。
+[verifier.environment]
+network_mode = "public"      # LLM judge 需要出网
 build_timeout_sec = 1800.0
 cpus = 2
 memory_mb = 4096
 storage_mb = 10240
 
-[steps.verifier.environment.env]
+[verifier.environment.env]
+
+# judge 的凭证从宿主机注入。注意：没有 :- 默认值的 ${VAR} 在宿主缺变量时会直接
+# 抛错，所以默认整段注释掉，保证骨架开箱可跑（此时 LLM judge 降级为纯程序化
+# 判分，并在 reward-details.json 里记 data_gaps）。
+# [verifier.env]
+# ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}"
+# DATACOM_JUDGE_MODEL = "anthropic/claude-opus-5-5"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 传给 verify.py 的环境变量。
+# 在 **agent 容器**里、artifacts 采集**之前**执行的钩子。
 #
-# 需要用 LLM 打分时取消注释。${...} 在**宿主机**上解析；注意没有 :- 默认值的
-# ${VAR} 在宿主缺变量时会直接抛错，所以这里默认整段注释掉，保证骨架开箱可跑。
+# 用途：把代码变更快照成 patch，作为"相对基线改了什么"的权威凭证——因为 .git
+# 被排除在 artifact 之外，verifier 里无法自己算 diff。
+# 写到 /logs/artifacts/ 会被隐式收集，无需再声明。
 # ─────────────────────────────────────────────────────────────────────────────
-# [steps.verifier.env]
-# DATACOM_JUDGE_API_KEY = "${DATACOM_JUDGE_API_KEY}"
-# DATACOM_JUDGE_MODEL = "openai/gpt-5.6-sol"
-# DATACOM_WORKSPACE = "/app"
-# DATACOM_TRAJECTORY_PATH = "/logs/agent/trajectory.json"
+[[verifier.collect]]
+command = "cd /app && git add -A && git diff --cached --binary > /logs/artifacts/changes.patch"
+service = "main"
+timeout_sec = 120

@@ -1,0 +1,92 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# datacom 模型换代对比 —— 运行配置
+#
+# 一次 job 就跑完"两个模型 × 同一份任务"的对比矩阵：
+#   job_plan.py 的 TrialConfig 推导是
+#       n_attempts × tasks × agents
+#   所以 agents 放两个模型、datasets 放一个用例集，就是本实验要的对比。
+#
+# 用法（在仓库根目录执行）：
+#
+#   PYTHONPATH=examples/tasks/datacom/compare \
+#   uv run harbor run \
+#       -c examples/tasks/datacom/compare/compare-job.yaml \
+#       --plugin model_comparison_plugin:ModelComparisonReport \
+#       --pk baseline_model=<老模型名>
+#
+# 说明：
+#   * PYTHONPATH 指向插件所在目录，`--plugin module:Class` 才能 import 到；
+#   * 插件只读结果、不改评测，失败也只会打 warning（finalize_job_plugins 兜住）；
+#   * 报告写到 jobs/<job_name>/comparison.html 与 comparison.json；
+#   * 不做对比、只想看单个模型的常规结果时，去掉 --plugin 即可。
+# ═════════════════════════════════════════════════════════════════════════════
+
+jobs_dir: jobs
+job_name: datacom-model-compare        # 固定名字便于反复对比；换实验记得改
+
+# ── 重复次数：对比评测的方差控制 ──────────────────────────────────────────────
+# ⚠️ 不要用 n_attempts: 1 做模型换代决策。
+# 单次运行的分数里混着"模型能力差异"和"这一次的运气"，两者无法分离。
+# 3 次起步，报告会给出主分数的 σ 与维度覆盖率；
+# σ 与两组均值的差同量级时，结论应当写成"需要更多样本"而不是"新模型更好"。
+n_attempts: 3
+
+# 并发上限。两个模型 × N 个用例 × n_attempts 会同时排队，
+# 这里按机器能承受的容器数设；再细的 per-agent 限流用 agents[].n_concurrent
+# （本实验两个模型对称，不需要）。
+n_concurrent_trials: 6
+
+environment:
+  type: docker
+  force_build: true
+  delete: true
+
+# ── 对比的两个模型 ───────────────────────────────────────────────────────────
+# 关键约束：**除模型外，其余全部逐字相同**。
+# agent、skills、kwargs、env、超时、环境配置只要有一处不同，对比就不成立。
+# 这不是风格问题——"新模型跑得更慢"很可能只是因为它多挂了一个 skill。
+agents:
+  - name: claude-code
+    model_name: <老模型>                 # TODO 换成实际模型名
+    skills:
+      # SDD 套件。Harbor 的 skills 解析规则（_find_skill_dirs）是：
+      #   * 目录里直接有 SKILL.md  → 它就是一个 skill；
+      #   * 否则，其**每个直接子目录**都必须有 SKILL.md，整体作为一个套件。
+      # 所以指向套件根目录即可，三个阶段的 skill 会被一起注入。
+      # 相对路径按运行 harbor 时的 cwd 解析。
+      - ./skills/datacom-sdd            # TODO 换成实际路径
+    # claude-code 默认从宿主环境读 ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL，
+    # 所以一般不用在这里写。走内网网关时才需要显式注入：
+    # env:
+    #   ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL}
+    #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+
+  - name: claude-code
+    model_name: <新模型>                 # TODO 换成实际模型名
+    skills:
+      - ./skills/datacom-sdd            # 与老模型完全一致
+    # env:
+    #   ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL}
+    #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+
+# ── 用例集 ───────────────────────────────────────────────────────────────────
+# 目录下每个子目录 = 一个 task。本实验建议先用单用例跑通对比链路，
+# 再扩到多用例（report 的"分任务主分数"矩阵会随之变得有意义）。
+datasets:
+  - path: ./cases/datacom                # TODO 换成实际用例集目录
+
+# ── 判分侧 judge 的凭证 ──────────────────────────────────────────────────────
+# 注意这里有**两层模型**，不要混：
+#   * 上面 agents[].model_name  = **被测模型**（实验变量）
+#   * judge 的模型与凭证         = **判分模型**（必须固定，绝不能跟着换）
+# 如果判分模型跟着实验变量一起换，两个模型的分数就不可比了 ——
+# 这是本实验最容易被忽视的污染源。judge 模型在
+# tests/process/efficiency.toml 的 [judge].judge 里声明，
+# 运行时可用 REWARDKIT_JUDGE / --judge 覆盖，但应当**全程固定同一个值**。
+#
+# 取消注释即可把 judge 凭证从宿主机注入 verifier 容器：
+#
+# verifier:
+#   env:
+#     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+

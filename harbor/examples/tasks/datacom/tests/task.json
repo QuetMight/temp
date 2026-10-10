@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "构建/测试规则。这是原流程「评测用例&答案/tasks/{用例}/{子用例}/task.json」的对应物。",
+    "它被 quality/code_quality.py 读取，用于 B2 build_pass_rate 与 B3 test_pass_rate。",
+    "命令在 verifier 容器里以 /app 为 cwd 执行（见 _lib/evidence.py 的 run_command）。",
+    "",
+    "为什么编译与测试命令放在判分侧、而不是让 agent 自己跑：",
+    "  * agent 可以改测试、跳过测试、或干脆不跑；判分侧的构建才是可信证据；",
+    "  * verifier 是独立容器，从同一份 /app 快照出发，两个模型面对完全相同的验证；",
+    "  * 命令缺失时子维度记为 None（动态加权忽略），而不是记 0 —— 见",
+    "    quality/code_quality.py 的「实现理念 3」。",
+    "",
+    "待你替换成真实工程的命令。命令必须能在 verifier 镜像里跑通，",
+    "所以 tests/Dockerfile 要装齐工具链；构建产物路径要与 environment/Dockerfile 的约定一致。"
+  ],
+  "validation": {
+    "compileCommands": [
+      "make -j4"
+    ],
+    "focusedTests": [
+      "make test"
+    ]
+  }
+}

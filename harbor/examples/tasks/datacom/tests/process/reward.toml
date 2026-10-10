@@ -1,0 +1,18 @@
+# process 维度内部的聚合（省略 name —— 目录名就是分数名）
+#
+# 这个维度里有两个判分输入：
+#   performance_trace.py  ← 程序化：可数的过程指标（轮次/工具错误率/重复调用/瓶颈）
+#   efficiency.toml       ← LLM judge：需要判断的过程质量（走偏/幻觉/三阶段连贯）
+#
+# 两者互补：程序化的那半秒级完成但看不到语义，judge 那半能看到语义但慢且贵。
+# 权重 0.6 / 0.4 沿用原体系 §7.4 的 C1 / C2 配比。
+#
+# ⚠️ 与 tests/reward.toml 的分工：
+#   * 这里（维度内）用声明式权重，因为两个输入都是"始终存在或被明确跳过"的，
+#     不需要缺失重归一化；
+#   * quality 维度则不能这么写，因为它的子维度会出现"没配构建命令"这种缺失，
+#     必须走 _lib/reward.py 的动态重归一化。这是两种场景的分界线：
+#     **缺失即忽略 → 用 Python；缺失即失败 → 用声明式权重。**
+[[reward]]
+aggregation = "weighted-mean"
+weights = { performance_trace = 0.6, efficiency = 0.4 }
